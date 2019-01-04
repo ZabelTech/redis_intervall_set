@@ -12,15 +12,16 @@ endif
 
 .SUFFIXES: .c .so .xo .o
 
-all: intervalSet.so
+all: t_iset.so
 
 .c.xo:
 	$(CC) -I. $(CFLAGS) $(SHOBJ_CFLAGS) -fPIC -c $< -o $@
 
-intervalSet.xo: ./redismodule.h
+t_iset.xo: ./redismodule.h
 
-intervalSet.so: intervalSet.xo
+t_iset.so: t_iset.xo
 	$(LD) -o $@ $< $(SHOBJ_LDFLAGS) $(LIBS) -lc
+
 
 clean:
 	rm -rf *.xo *.so

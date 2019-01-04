@@ -79,7 +79,7 @@
 /* The instance has Maxmemory set */
 #define REDISMODULE_CTX_FLAGS_MAXMEMORY 0x0100
 /* Maxmemory is set and has an eviction policy that may delete keys */
-#define REDISMODULE_CTX_FLAGS_EVICT 0x0200 
+#define REDISMODULE_CTX_FLAGS_EVICT 0x0200
 
 
 /* A special pointer that we can use between the core and the module to signal
@@ -88,6 +88,7 @@
 
 /* Error messages. */
 #define REDISMODULE_ERRORMSG_WRONGTYPE "WRONGTYPE Operation against a key holding the wrong kind of value"
+#define REDISMODULE_ERRORMSG_SYNTAXERR "ERR syntax error"
 
 #define REDISMODULE_POSITIVE_INFINITE (1.0/0.0)
 #define REDISMODULE_NEGATIVE_INFINITE (-1.0/0.0)

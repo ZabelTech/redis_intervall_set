@@ -4,6 +4,39 @@
 #include <math.h>
 #include <string.h>
 
+//=============================
+
+static RedisModuleType *ISet;
+
+int dictEncObjKeyCompare(void *privdata, const void *key1, const void *key2) {
+  DICT_NOTUSED(privdata);
+  return RedisModule_StringCompare((RedisModuleString *) key1,
+				   (RedisModuleString *) key2) == 0;
+}
+
+uint64_t dictEncObjHash(const void *key) {
+  size_t len;
+  const char * keyStr;
+  keyStr = RedisModule_StringPtrLen((RedisModuleString *)key,&len);
+  return dictGenHashFunction(keyStr, len);
+}
+
+void dictObjectDestructor(void *privdata, void *val) {
+    DICT_NOTUSED(privdata);
+    if (val == NULL) return;
+    RedisModule_Free((RedisModuleString *) val);
+}
+
+dictType isetDictType = {
+    dictEncObjHash,            /* hash function */
+    NULL,                      /* key dup */
+    NULL,                      /* val dup */
+    dictEncObjKeyCompare,      /* key compare */
+    dictObjectDestructor,      /* key destructor */
+    NULL                       /* val destructor */
+};
+//=============================
+
 /*-----------------------------------------------------------------------------
  * Interval set API
  *----------------------------------------------------------------------------*/
@@ -15,8 +48,6 @@
  * The elements are added to an hash table mapping Redis objects to intervals.
  * At the same time the elements are added to an augmented AVL tree that maps
  * intervals to Redis objects. */
-
-static RedisModuleType *ISet;
 
 typedef struct avlNode {
        RedisModuleString *obj;
@@ -32,83 +63,67 @@ typedef struct avl {
        unsigned long size;
 } avl;
 
-/*
-This structure is a simple linked list that is built during the
-avlFind method. On each successful stab, the stabbed node is
-added to the list and the list tail is updated to the new node.
-The genericStabCommand maintains a pointer to the list head, which
-is the initial node passed to avlFind.
-*/
-typedef struct avlResultNode {
-    avlNode * data;
-    struct avlResultNode * next;
-} avlResultNode;
-
-int dictEncObjKeyCompare(void *privdata, const void *key1, const void *key2) {
-  DICT_NOTUSED(privdata);
-  return RedisModule_StringCompare((RedisModuleString *) key1,
-				   (RedisModuleString *) key2) == 0;
-}
-
-uint64_t dictEncObjHash(const void *key) {
-  size_t len;
-  const char * keyStr;
-  keyStr = RedisModule_StringPtrLen((RedisModuleString *)key,&len);
-  return dictGenHashFunction(keyStr, len);
-}
-
-void dictObjectDestructor(void *privdata, void *key) {
-    DICT_NOTUSED(privdata);
-    RedisModule_Free((RedisModuleString *) key);
-}
-
-dictType isetDictType = {
-    dictEncObjHash,            /* hash function */
-    NULL,                      /* key dup */
-    NULL,                      /* val dup */
-    dictEncObjKeyCompare,      /* key compare */
-    dictObjectDestructor,      /* key destructor */
-    NULL                       /* val destructor */
-};
-
 avl *avlCreate(void) {
-    avl *avltree  = RedisModule_Alloc(sizeof(avl));
+    avl *avltree;
+
+    avltree = RedisModule_Alloc(sizeof(*avltree));
     avltree->size = 0;
     avltree->root = NULL;
+
     avltree->dict = dictCreate(&isetDictType,NULL);
+
     return avltree;
 }
 
-avlNode *avlCreateNode(double lscore, double rscore, RedisModuleString *obj) {
-    avlNode *an     = RedisModule_Alloc(sizeof(*an));
-    an->scores[0]   = lscore;
-    an->scores[1]   = rscore;
-    an->subLeftMax  = -INFINITY;
+avlNode *avlCreateNode(RedisModuleCtx *ctx, double lscore, double rscore, RedisModuleString *obj) {
+    avlNode *an = RedisModule_Alloc(sizeof(*an));
+    an->scores[0] = lscore;
+    an->scores[1] = rscore;
+    an->subLeftMax = -INFINITY;
     an->subRightMax = -INFINITY;
     an->balance = 0;
-    an->left    = NULL;
-    an->right   = NULL;
-    an->parent  = NULL;
-    an->next    = NULL;
-    an->obj     = obj;
+    an->left = NULL;
+    an->right = NULL;
+    an->parent = NULL;
+    an->next = NULL;
+    an->obj = obj;
+
+    if (obj)
+	RedisModule_RetainString(ctx, obj);
+
     return an;
 }
 
 void avlFreeNode(RedisModuleCtx *ctx, avlNode *node, int eraseList) {
     if (eraseList && node->next)
-      avlFreeNode(ctx, node->next, eraseList);
+	avlFreeNode(ctx, node->next, eraseList);
+    if (node->obj)
+	RedisModule_FreeString(ctx,node->obj);
     if (node->left)
-      avlFreeNode(ctx, node->left, eraseList);
+	avlFreeNode(ctx, node->left, eraseList);
     if (node->right)
-      avlFreeNode(ctx, node->right, eraseList);
+	avlFreeNode(ctx, node->right, eraseList);
     RedisModule_Free(node);
 }
 
-void avlFree(RedisModuleCtx *ctx, avl *tree) {
+void avlFreeTree(avlNode *node, int eraseList) {
+    if (eraseList && node->next)
+	avlFreeTree(node->next, eraseList);
+    if (node->obj)
+	RedisModule_Free(node->obj);
+    if (node->left)
+	avlFreeTree(node->left, eraseList);
+    if (node->right)
+	avlFreeTree(node->right, eraseList);
+    RedisModule_Free(node);
+}
+
+void avlFree(void *o) {
+    avl *tree = o;
     if (tree->root != NULL)
-      avlFreeNode(ctx, tree->root,1);
+	avlFreeTree(tree->root,1);
+    dictRelease(tree->dict);
     RedisModule_Free(tree);
-    tree = (avl *) NULL;
 }
 
 int avlNodeCmp(avlNode *a, avlNode *b) {
@@ -212,7 +227,6 @@ void avlUpdateMaxScores(avlNode *locNode) {
 
 int avlInsertNode(avl * tree, avlNode *locNode, avlNode *insertNode) {
     int diff = avlNodeCmp(locNode, insertNode);
-
     /* Insert in the left node */
     if (diff > 0) {
 	if (!locNode->left) {
@@ -310,7 +324,7 @@ int avlInsertNode(avl * tree, avlNode *locNode, avlNode *insertNode) {
 	    return 0;
 	}
     }
-    // These nodes have the same range. We're going to assume that the robj hasn't been
+    // These nodes have the same range. We're going to assume that the RedisModuleString hasn't been
     // added before to this range, as the caller to avlInsert should check this
     else {
 	avlNode * tail = locNode;
@@ -321,8 +335,8 @@ int avlInsertNode(avl * tree, avlNode *locNode, avlNode *insertNode) {
     }
 }
 
-avlNode *avlInsert(avl *tree, double lscore, double rscore, RedisModuleString *obj) {
-    avlNode *an = avlCreateNode(lscore, rscore, obj);
+avlNode *avlInsert(RedisModuleCtx *ctx, avl *tree, double lscore, double rscore, RedisModuleString *obj) {
+    avlNode *an = avlCreateNode(ctx, lscore, rscore, obj);
 
     if (!tree->root)
 	tree->root = an;
@@ -363,7 +377,7 @@ int avlRemoveNode(RedisModuleCtx *ctx, avl * tree, avlNode *locNode, avlNode *de
 	    avlNode *prevNode = NULL;
 
 	    // Find the node where the node obj data matches the delNode obj data
-	    while (RedisModule_StringCompare(removeNode->obj, delNode->obj) != 0) {
+	    while (RedisModule_StringCompare(removeNode->obj,delNode->obj) != 0) {
 		prevNode = removeNode;
 		removeNode = removeNode->next;
 	    }
@@ -385,13 +399,13 @@ int avlRemoveNode(RedisModuleCtx *ctx, avl * tree, avlNode *locNode, avlNode *de
 
 		locNode->right = NULL;
 		locNode->left = NULL;
-		avlFreeNode(ctx,locNode,0);
+		avlFreeNode(ctx, locNode,0);
 		*removed = 1;
 		return 0;
 	    }
 	    else {
 		prevNode->next = removeNode->next;
-		avlFreeNode(ctx,removeNode,0);
+		avlFreeNode(ctx, removeNode,0);
 		*removed = 1;
 		return 0;
 	    }
@@ -404,7 +418,7 @@ int avlRemoveNode(RedisModuleCtx *ctx, avl * tree, avlNode *locNode, avlNode *de
 		    if (locNode->parent)
 			avlUpdateMaxScores(locNode->parent);
 		    if (freeNodeMem)
-		      avlFreeNode(ctx,locNode,0);
+			avlFreeNode(ctx, locNode,0);
 		    *removed = 1;
 		    return -1;
 		}
@@ -414,7 +428,7 @@ int avlRemoveNode(RedisModuleCtx *ctx, avl * tree, avlNode *locNode, avlNode *de
 		    avlUpdateMaxScores(locNode->parent);
 		locNode->right = NULL;
 		if (freeNodeMem)
-		  avlFreeNode(ctx,locNode,0);
+		   avlFreeNode(ctx, locNode,0);
 		*removed = 1;
 		return -1;
 	    }
@@ -425,7 +439,7 @@ int avlRemoveNode(RedisModuleCtx *ctx, avl * tree, avlNode *locNode, avlNode *de
 		    avlUpdateMaxScores(locNode->parent);
 		locNode->left = NULL;
 		if (freeNodeMem)
-		  avlFreeNode(ctx,locNode,0);
+		    avlFreeNode(ctx, locNode,0);
 		*removed = 1;
 		return -1;
 	    }
@@ -476,7 +490,7 @@ int avlRemoveNode(RedisModuleCtx *ctx, avl * tree, avlNode *locNode, avlNode *de
 	    locNode->left = NULL;
 	    locNode->right = NULL;
 	    if (freeNodeMem)
-	      avlFreeNode(ctx,locNode,0);
+		avlFreeNode(ctx, locNode,0);
 
 	    if (replacementNode->balance == 0)
 		return heightDelta;
@@ -490,7 +504,7 @@ int avlRemoveNode(RedisModuleCtx *ctx, avl * tree, avlNode *locNode, avlNode *de
     // The node is in the left subtree
     else if (diff > 0) {
 	if (locNode->left) {
-	  heightDelta = avlRemoveNode(ctx, tree, locNode->left,delNode,freeNodeMem,removed);
+	    heightDelta = avlRemoveNode(ctx,tree,locNode->left,delNode,freeNodeMem,removed);
 	    if (heightDelta) {
 		locNode->balance = locNode->balance + 1;
 		if (locNode->balance == 0)
@@ -539,7 +553,7 @@ int avlRemoveNode(RedisModuleCtx *ctx, avl * tree, avlNode *locNode, avlNode *de
     // The node is in the right subtree
     else if (diff < 0) {
 	if (locNode->right) {
-	  heightDelta = avlRemoveNode(ctx, tree, locNode->right,delNode,freeNodeMem,removed);
+	    heightDelta = avlRemoveNode(ctx,tree,locNode->right,delNode,freeNodeMem,removed);
 	    if (heightDelta) {
 		locNode->balance = locNode->balance - 1;
 		if (locNode->balance == 0)
@@ -588,13 +602,13 @@ int avlRemoveNode(RedisModuleCtx *ctx, avl * tree, avlNode *locNode, avlNode *de
     return 0;
 }
 
-int avlRemove(RedisModuleCtx *ctx,avl *tree, double lscore, double rscore, RedisModuleString * obj) {
+int avlRemove(RedisModuleCtx *ctx, avl *tree, double lscore, double rscore, RedisModuleString * obj) {
     int removed = 0;
 
     if (!tree->root)
 	return 0;
 
-    avlNode *delNode = avlCreateNode(lscore, rscore, obj);
+    avlNode *delNode = avlCreateNode(ctx, lscore, rscore, obj);
     avlRemoveNode(ctx, tree, tree->root, delNode, 1, &removed);
     avlFreeNode(ctx,delNode,0);
 
@@ -607,9 +621,21 @@ int avlRemove(RedisModuleCtx *ctx,avl *tree, double lscore, double rscore, Redis
     return removed;
 }
 
-long long isetLength(avl *iset) {
-  return (iset->size);
+size_t isetLength(const void *obj) {
+    return ((avl *) obj)->size;
 }
+
+/*
+This structure is a simple linked list that is built during the
+avlFind method. On each successful stab, the stabbed node is
+added to the list and the list tail is updated to the new node.
+The genericStabCommand maintains a pointer to the list head, which
+is the initial node passed to avlFind.
+*/
+typedef struct avlResultNode {
+    avlNode * data;
+    struct avlResultNode * next;
+} avlResultNode;
 
 avlResultNode *avlCreateResultNode(avlNode *data) {
     avlResultNode *arn = RedisModule_Alloc(sizeof(*arn));
@@ -659,54 +685,24 @@ avlResultNode * avlStab(avlNode *node, double min, double max, avlResultNode *re
  * Interval set commands
  *----------------------------------------------------------------------------*/
 
-int iaddCommand(RedisModuleCtx *ctx, avl * iobj, RedisModuleString * ele, double min, double max) {
-    avlNode * addedNode;
-    double * scores = NULL;
-
-    dictEntry * de = dictFind(iobj->dict,ele);
-
-    if (de != NULL) {
-      scores = dictGetVal(de);
-
-      /* RedisModule_StringToLongLong(de,(long long *)&curobj); */
-      if (scores[0] != min || scores[1] != max) {
-	// remove and re-insert
-	avlRemove(ctx, iobj, scores[0], scores[1], ele);
-	addedNode = avlInsert(iobj, min, max, ele);
-	dictGetVal(de) = addedNode->scores;
-      }
-    } else {
-      /* insert into the tree */
-      addedNode = avlInsert(iobj, min, max, ele);
-      dictAdd(iobj->dict,ele,&addedNode->scores);
-    }
-    return REDISMODULE_OK;
-}
-
-int iremCommand(RedisModuleCtx *ctx, avl * iobj, RedisModuleString * ele) {
-    double *scores = NULL;
-    dictEntry *de = dictFind(iobj->dict,ele);
-    if (de != NULL) {
-      scores = (double *) dictGetVal(de);
-      avlRemove(ctx,iobj,scores[0],scores[1],ele);
-      dictDelete(iobj->dict,ele);
-      return 1;
-    }
-    return 0;
-}
 
 
-//----------------------------------------------------------------------------------
-
-
-int ISetAdd_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
-    /* RedisModule_AutoMemory(ctx); */
+int iaddCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
+    RedisModule_AutoMemory(ctx);
+    RedisModuleString *key = argv[1];
+    RedisModuleString *ele;
+    double * curscores;
+    double min = 0, max = 0;
+    int added = 0;
     double *mins, *maxes;
     int j, elements = (argc-2)/3;
-
+    avl *tree;
+    avlNode *addedNode;
+    dictEntry *de;
     /* 5, 8, 11... arguments */
     if ((argc - 2) % 3) {
-	return RedisModule_WrongArity(ctx);
+	RedisModule_WrongArity(ctx);
+	return REDISMODULE_ERR;
     }
 
     /* Start parsing all the scores, we need to emit any syntax error
@@ -715,165 +711,346 @@ int ISetAdd_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc
     mins  = RedisModule_Alloc(sizeof(double)*elements);
     maxes = RedisModule_Alloc(sizeof(double)*elements);
     for (j = 0; j < elements; j++) {
-      if (RedisModule_StringToDouble(argv[2+j*3],&mins[j])  != REDISMODULE_OK ||
-	  RedisModule_StringToDouble(argv[3+j*3],&maxes[j]) != REDISMODULE_OK)
+	/* mins are 2, 5, 8... */
+	if (RedisModule_StringToDouble(argv[2+j*3],&mins[j])
+	    != REDISMODULE_OK)
 	{
-	    return RedisModule_ReplyWithError(ctx,"ERR invalid obj: must be a signed 64 bit integer");
+	    RedisModule_Free(mins);
+	    RedisModule_Free(maxes);
+	    RedisModule_ReplyWithError(ctx,REDISMODULE_ERRORMSG_SYNTAXERR);
+	    return REDISMODULE_ERR;
+	}
+	/* maxes are 3, 6, 9... */
+	if (RedisModule_StringToDouble(argv[3+j*3],&maxes[j])
+	    != REDISMODULE_OK)
+	{
+	    RedisModule_Free(mins);
+	    RedisModule_Free(maxes);
+	    RedisModule_ReplyWithError(ctx,REDISMODULE_ERRORMSG_SYNTAXERR);
+	    return REDISMODULE_ERR;
 	}
     }
 
     /* Lookup the key and create the interval tree if does not exist. */
-    RedisModuleKey *key = RedisModule_OpenKey(ctx,argv[1],
-	REDISMODULE_READ|REDISMODULE_WRITE);
-    int type = RedisModule_KeyType(key);
-    if (type != REDISMODULE_KEYTYPE_EMPTY &&
-	RedisModule_ModuleTypeGetType(key) != ISet)
-    {
-	return RedisModule_ReplyWithError(ctx,REDISMODULE_ERRORMSG_WRONGTYPE);
+    RedisModuleKey *ikey = RedisModule_OpenKey(ctx,key,REDISMODULE_READ|REDISMODULE_WRITE);
+    if (RedisModule_KeyType(ikey) != REDISMODULE_KEYTYPE_EMPTY &&
+	RedisModule_ModuleTypeGetType(ikey) != ISet)
+      {
+	    RedisModule_Free(mins);
+	    RedisModule_Free(maxes);
+	    RedisModule_ReplyWithError(ctx,REDISMODULE_ERRORMSG_WRONGTYPE);
+	    return REDISMODULE_ERR;
     }
 
-    avl * avltree = RedisModule_ModuleTypeGetValue(key);
+    tree = RedisModule_ModuleTypeGetValue(ikey);
 
-    if (type == REDISMODULE_KEYTYPE_EMPTY ||
-	avltree == NULL) {
-      avltree = avlCreate();
-      if(RedisModule_ModuleTypeSetValue(key,ISet,avltree)
-	 != REDISMODULE_OK)
-	{
+    if (tree == NULL) {
+      tree = avlCreate();
+      if(RedisModule_ModuleTypeSetValue(ikey,ISet,tree) != REDISMODULE_OK) {
 	  return REDISMODULE_ERR;
 	}
     }
-
-    RedisModuleString * ele;
     for (j = 0; j < elements; j++) {
-      ele = RedisModule_CreateStringFromString(ctx,argv[4+j*3]);
-      if(iaddCommand(ctx, avltree, ele, mins[j], maxes[j])
-	 != REDISMODULE_OK)
-	{
-	  return RedisModule_ReplyWithError(ctx, "error while inserting");
+	min = mins[j];
+	max = maxes[j];
+
+	ele = argv[4+j*3];
+
+	de  = dictFind(tree->dict,ele);
+	/* If object is found in iobj */
+
+	if (de != NULL) {
+	    curscores = (double *) dictGetVal(de);
+
+	    if (curscores[0] != min || curscores[1] != max) {
+		// remove and re-insert
+		avlRemove(ctx, tree, curscores[0], curscores[1], ele);
+		addedNode = avlInsert(ctx, tree, min, max, ele);
+		dictGetVal(de) = addedNode->scores; /* Update scores ptr. */
+		added++;
+	    }
+	} else {
+	    /* insert into the tree */
+	    addedNode = avlInsert(ctx, tree, min, max, ele);
+	    if(!(dictAdd(tree->dict,ele,&addedNode->scores) == DICT_OK)) return REDISMODULE_ERR;
+	    RedisModule_RetainString(ctx,ele); /* Added to dictionary. */
+	    added++;
 	}
     }
-    RedisModule_CloseKey(key);
-    return RedisModule_ReplyWithLongLong(ctx,j);
+
+    RedisModule_Free(mins);
+    RedisModule_Free(maxes);
+
+    RedisModule_CloseKey(ikey);
+    RedisModule_ReplyWithLongLong(ctx,added);
+
+    return REDISMODULE_OK;
 }
 
-int ISetRem_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
+/* This command implements ISTAB, ISTABINTERVAL. */
+int genericStabCommand(RedisModuleCtx *ctx, RedisModuleString *lscoreObj, RedisModuleString *rscoreObj, int intervalstab, RedisModuleString **argv, int argc) {
     RedisModule_AutoMemory(ctx);
-    int deleted = 0, j;
-    avl *avltree;
-    RedisModuleKey *key = RedisModule_OpenKey(ctx,argv[1],
-	REDISMODULE_READ|REDISMODULE_WRITE);
-
-    if (RedisModule_ModuleTypeGetType(key) != ISet) {
-	return RedisModule_ReplyWithError(ctx,REDISMODULE_ERRORMSG_WRONGTYPE);
-    }
-
-    avltree = RedisModule_ModuleTypeGetValue(key);
-
-    if (avltree == NULL)
-    {
-	return RedisModule_ReplyWithError(ctx,REDISMODULE_ERRORMSG_WRONGTYPE);
-    }
-
-    for (j = 2; j < argc; j++) {
-      deleted += iremCommand(ctx,avltree,argv[j]);
-    }
-    return RedisModule_ReplyWithLongLong(ctx,deleted);
-}
-
-int ISetStab_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
-    RedisModule_AutoMemory(ctx);
-    double lscore;
+    double lscore, rscore;
+    int withintervals = 0;
+    RedisModuleString *key = argv[1];
+    avlResultNode * resnode;
     avlResultNode * reswalker;
     avlNode * nodewalker;
     unsigned long resultslen = 0;
+    avl * tree;
 
-    if (argc < 2) {
-      return RedisModule_WrongArity(ctx);
+    if (intervalstab) {
+	if (argc > 4) {
+	    if (!RedisModule_StringCompare(argv[4],RedisModule_CreateString(ctx,"withintervals",14)))
+		withintervals = 1;
+	    else {
+		RedisModule_ReplyWithError(ctx,REDISMODULE_ERRORMSG_SYNTAXERR);
+		return REDISMODULE_ERR;
+	    }
+	}
+    } else {
+	if (argc > 3) {
+	    if (!RedisModule_StringCompare(argv[3],RedisModule_CreateString(ctx,"withintervals",14)))
+		withintervals = 1;
+	    else {
+		RedisModule_ReplyWithError(ctx,REDISMODULE_ERRORMSG_SYNTAXERR);
+		return REDISMODULE_ERR;
+	    }
+	}
     }
 
-    if (RedisModule_StringToDouble(argv[2],&lscore) != REDISMODULE_OK) {
-      return RedisModule_ReplyWithError(ctx,"ERR invalid obj: must be a signed 64 bit integer");
+    if (RedisModule_StringToDouble(lscoreObj,&lscore) != REDISMODULE_OK) {
+	return REDISMODULE_ERR;
     }
 
-    RedisModuleKey *key = RedisModule_OpenKey(ctx,argv[1],REDISMODULE_READ);
-
-    if (RedisModule_ModuleTypeGetType(key) != ISet)
-    {
-	return RedisModule_ReplyWithError(ctx,REDISMODULE_ERRORMSG_WRONGTYPE);
+    if (RedisModule_StringToDouble(rscoreObj,&rscore) != REDISMODULE_OK) {
+	return REDISMODULE_ERR;
     }
 
-    avl *avltree = RedisModule_ModuleTypeGetValue(key);
-
-    if (avltree == NULL)
-    {
-	return RedisModule_ReplyWithError(ctx,REDISMODULE_ERRORMSG_WRONGTYPE);
+    RedisModuleKey *ikey = RedisModule_OpenKey(ctx,key,REDISMODULE_READ|REDISMODULE_WRITE);
+    if (RedisModule_KeyType(ikey) == REDISMODULE_KEYTYPE_EMPTY &&
+	RedisModule_ModuleTypeGetType(ikey) != ISet)
+      {
+	    RedisModule_ReplyWithError(ctx,REDISMODULE_ERRORMSG_WRONGTYPE);
+	    return REDISMODULE_ERR;
     }
 
-    if (avltree->root == NULL) {
-      return RedisModule_ReplyWithNull(ctx);
-    }
+    tree = RedisModule_ModuleTypeGetValue(ikey);
 
-    reswalker = avlStab(avltree->root, lscore, lscore, NULL);
+    resnode = avlStab(tree->root, lscore, rscore, NULL);
 
     /* No results. */
-    if (reswalker == NULL) {
-      return RedisModule_ReplyWithNull(ctx);
+    if (resnode == NULL) {
+	RedisModule_ReplyWithNull(ctx);
+	return REDISMODULE_ERR;
     }
 
+    /* We don't know in advance how many matching elements there are in the
+     * list, so we push this object that will represent the multi-bulk
+     * length in the output buffer, and will "fix" it later */
     RedisModule_ReplyWithArray(ctx,REDISMODULE_POSTPONED_ARRAY_LEN);
+    reswalker = resnode;
+
     while (reswalker != NULL) {
 	nodewalker = reswalker->data;
 	while (nodewalker != NULL) {
 	    resultslen++;
 	    RedisModule_ReplyWithString(ctx,nodewalker->obj);
+	    /* if (withintervals) { */
+	    /*	RedisModule_ReplyWithDouble(ctx,nodewalker->scores[0]); */
+	    /*	RedisModule_ReplyWithDouble(ctx,nodewalker->scores[1]); */
+	    /* } */
 	    nodewalker = nodewalker->next;
 	}
 	reswalker = reswalker->next;
     }
+
+    if (withintervals)
+	resultslen *= 3;
+
     RedisModule_ReplySetArrayLength(ctx,resultslen);
+
+    if (resnode)
+	avlFreeResults(resnode);
     return REDISMODULE_OK;
 }
 
-size_t ISetMemUsage(const void *value) {
-  return isetLength((avl *) value);
+int istabCommand(RedisModuleCtx *ctx,RedisModuleString **argv, int argc) {
+    return genericStabCommand(ctx,argv[2],argv[2],0,argv,argc);
 }
 
-void ISetFree(void *value) {
-  avlFree(NULL,value);
+int istabIntervalCommand(RedisModuleCtx *ctx,RedisModuleString **argv, int argc) {
+    return genericStabCommand(ctx,argv[2],argv[3],1,argv,argc);
 }
 
-/* void ISetAofRewrite(RedisModuleIO *aof, RedisModuleString *key, void *value) { */
-/*     long long count = 0, items = isetLength(value); */
-/*     dictEntry *de; */
+void irembystabCommand(RedisModuleCtx *ctx,RedisModuleString **argv) {
+    RedisModuleString *key = argv[1];
+    long long point;
+    avlResultNode * resnode;
+    avlResultNode * reswalker;
+    avlNode * nodewalker;
+    avl * tree;
+    int deleted = 0;
+    dictEntry *de;
+    double *curscores;
 
-/*     if (o->encoding == OBJ_ENCODING_AVLTREE) { */
-/*	dictIterator *di = dictGetIterator(o->dict); */
+    if (RedisModule_StringToLongLong(argv[2], &point) != REDISMODULE_OK) return;
 
-/*	while((de = dictNext(di)) != NULL) { */
-/*	    RedisModuleString *ele = dictGetKey(de); */
-/*	    avl *node = dictGetVal(de); */
+    /* Lookup the key and create the interval tree if does not exist. */
+    RedisModuleKey *ikey = RedisModule_OpenKey(ctx,key,REDISMODULE_READ|REDISMODULE_WRITE);
+    int type = RedisModule_KeyType(ikey);
+    if (type != REDISMODULE_KEYTYPE_EMPTY &&
+	RedisModule_ModuleTypeGetType(ikey) != ISet)
+      {
+	    RedisModule_ReplyWithError(ctx,REDISMODULE_ERRORMSG_WRONGTYPE);
+	    return;
+    }
 
-/*	    if (count == 0) { */
-/*		int cmd_items = (items > AOF_REWRITE_ITEMS_PER_CMD) ? */
-/*		    AOF_REWRITE_ITEMS_PER_CMD : items; */
+    tree = RedisModule_ModuleTypeGetValue(ikey);
 
-/*		if (rioWriteBulkCount(r,'*',2+cmd_items*3) == 0) return 0; */
-/*		if (rioWriteBulkString(r,"IADD",4) == 0) return 0; */
-/*		if (rioWriteBulkObject(r,key) == 0) return 0; */
-/*	    } */
-/*	    if (rioWriteBulkDouble(r,(*scores)[0]) == 0) return 0; */
-/*	    if (rioWriteBulkDouble(r,(*scores)[1]) == 0) return 0; */
-/*	    if (rioWriteBulkObject(r,eleobj) == 0) return 0; */
-/*	    if (++count == AOF_REWRITE_ITEMS_PER_CMD) count = 0; */
-/*	    items--; */
-/*	} */
-/*	dictReleaseIterator(di); */
-/*     } else { */
-/*	serverPanic("Unknown interval set encoding"); */
-/*     } */
-/*     return 1; */
-/* } */
+    resnode = avlStab(tree->root, point, point, NULL);
+
+    /* No results. */
+    if (resnode == NULL) {
+	RedisModule_ReplyWithLongLong(ctx, 0);
+	return;
+    }
+
+    reswalker = resnode;
+
+    while (reswalker != NULL) {
+	nodewalker = reswalker->data;
+	while (nodewalker != NULL) {
+	    de = dictFind(tree->dict,nodewalker->obj);
+	    if (de != NULL) {
+		deleted++;
+
+		/* delete from the tree */
+		curscores = (double *) dictGetVal(de);
+		avlRemove(ctx,tree,curscores[0],curscores[1],nodewalker->obj);
+
+		/* delete from the hash table */
+		dictDelete(tree->dict,nodewalker->obj);
+
+		if (dictSize(tree->dict) == 0) {
+		    RedisModule_UnlinkKey(ikey);
+		    break;
+		}
+	    }
+	    nodewalker = nodewalker->next;
+	}
+	reswalker = reswalker->next;
+    }
+
+    if (resnode)
+	avlFreeResults(resnode);
+
+    RedisModule_ReplyWithLongLong(ctx,deleted);
+}
+
+int iremCommand(RedisModuleCtx *ctx,RedisModuleString **argv, int argc) {
+    RedisModule_AutoMemory(ctx);
+    RedisModuleString *key = argv[1];
+    RedisModuleString *ele;
+    double *curscores;
+    int deleted = 0, j;
+    dictEntry *de;
+    avl *tree;
+
+    /* Lookup the key and create the interval tree if does not exist. */
+    RedisModuleKey *ikey = RedisModule_OpenKey(ctx,key,REDISMODULE_READ|REDISMODULE_WRITE);
+    int type = RedisModule_KeyType(ikey);
+    if (type != REDISMODULE_KEYTYPE_EMPTY &&
+	RedisModule_ModuleTypeGetType(ikey) != ISet)
+      {
+	    RedisModule_ReplyWithError(ctx,REDISMODULE_ERRORMSG_WRONGTYPE);
+	    return REDISMODULE_ERR;
+    }
+
+    tree = RedisModule_ModuleTypeGetValue(ikey);
+
+    for (j = 2; j < argc; j++) {
+	ele = argv[j];
+	de = dictFind(tree->dict,ele);
+
+	if (de != NULL) {
+	    deleted++;
+
+	    /* delete from the tree */
+	    curscores = (double *) dictGetVal(de);
+	    avlRemove(ctx,tree,curscores[0],curscores[1],ele);
+
+	    /* delete from the hash table */
+	    dictDelete(tree->dict,ele);
+	    if (dictSize(tree->dict) == 0) {
+		RedisModule_UnlinkKey(ikey);
+		break;
+	    }
+	}
+    }
+
+    RedisModule_ReplyWithLongLong(ctx,deleted);
+    return REDISMODULE_OK;
+}
+
+void *isetRdbLoad(RedisModuleIO *rdb, int encver){
+  REDISMODULE_NOT_USED(encver);
+  uint64_t isetlen;
+  avl *tree;
+  RedisModuleCtx *ctx;
+
+  ctx     = RedisModule_GetContextFromIO(rdb);
+  tree    = avlCreate();
+  isetlen = RedisModule_LoadUnsigned(rdb);
+
+  while(isetlen--) {
+    RedisModuleString *ele;
+    double score1;
+    double score2;
+
+    avlNode *inode;
+
+    ele    = RedisModule_LoadString(rdb);
+    score1 = RedisModule_LoadDouble(rdb);
+    score2 = RedisModule_LoadDouble(rdb);
+
+    inode = avlInsert(ctx, tree, score1, score2, ele);
+    dictAdd(tree->dict,ele,&inode->scores);
+    RedisModule_RetainString(ctx,ele); /* Added to dictionary. */
+  }
+  return avlCreate;
+}
+
+void isetRdbSave(RedisModuleIO *rdb, void *value){
+  avl * tree = value;
+  dictIterator *di = dictGetIterator(tree->dict);
+  dictEntry *de;
+  uint64_t isetlen = isetLength(value);
+
+  RedisModule_SaveUnsigned(rdb,isetlen);
+  while((de = dictNext(di)) != NULL) {
+    RedisModuleString *eleobj = dictGetKey(de);
+    double *scores = dictGetVal(de);
+    RedisModule_SaveString(rdb,eleobj);
+    RedisModule_SaveDouble(rdb,scores[0]);
+    RedisModule_SaveDouble(rdb,scores[1]);
+  }
+  dictReleaseIterator(di);
+}
+
+void rewriteIntervalSetObject(RedisModuleIO *r, RedisModuleString *key, void *o) {
+    dictIterator *di = dictGetIterator(((avl *) o)->dict);
+    dictEntry *de;
+    const char *keyStr = RedisModule_StringPtrLen(key,NULL);
+
+    while((de = dictNext(di)) != NULL) {
+      RedisModuleString *eleobj = dictGetKey(de);
+      double **scores           = dictGetVal(de);
+      const char *eleStr        = RedisModule_StringPtrLen(eleobj,NULL);
+      RedisModule_EmitAOF(r,"IADD","%s %d %d %s", keyStr, (*scores)[0], (*scores)[1], eleStr);
+    }
+    dictReleaseIterator(di);
+}
 
 int RedisModule_OnLoad(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
     REDISMODULE_NOT_USED(argv);
@@ -884,27 +1061,32 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) 
 
     RedisModuleTypeMethods tm = {
 	.version     = REDISMODULE_TYPE_METHOD_VERSION,
-	/* .rdb_load    = ISetRdbLoad, */
-	/* .rdb_save    = ISetRdbSave, */
-	/* .aof_rewrite = ISetAofRewrite, */
-	.free        = ISetFree,
-	.mem_usage   = ISetMemUsage,
-	/* .digest      = ISetDigest */
+	/* .rdb_load    = isetRdbLoad, */
+	/* .rdb_save    = isetRdbSave, */
+	/* .aof_rewrite = rewriteIntervalSetObject, */
+	.free        = avlFree,
+	/* .mem_usage   = isetLength, */
+	/* .digest      = NULL */
     };
 
     ISet = RedisModule_CreateDataType(ctx,"intervalS",0,&tm);
     if (ISet == NULL) return REDISMODULE_ERR;
     if (RedisModule_CreateCommand(ctx,"intervallSet.insert",
-	ISetAdd_RedisCommand,"write deny-oom",1,1,1) == REDISMODULE_ERR)
+	iaddCommand,"write deny-oom",1,1,1) == REDISMODULE_ERR)
 	return REDISMODULE_ERR;
 
     if (RedisModule_CreateCommand(ctx,"intervallSet.rem",
-	ISetRem_RedisCommand,"write",1,1,1) == REDISMODULE_ERR)
+	iremCommand,"write",1,1,1) == REDISMODULE_ERR)
 	return REDISMODULE_ERR;
 
     if (RedisModule_CreateCommand(ctx,"intervallSet.stab",
-	ISetStab_RedisCommand,"write",1,1,1) == REDISMODULE_ERR)
+	istabCommand,"write",1,1,1) == REDISMODULE_ERR)
 	return REDISMODULE_ERR;
+
+    if (RedisModule_CreateCommand(ctx,"intervallSet.stabIntervall",
+	istabIntervalCommand,"write",1,1,1) == REDISMODULE_ERR)
+	return REDISMODULE_ERR;
+
 
     return REDISMODULE_OK;
 }
