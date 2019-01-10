@@ -10,8 +10,7 @@ static RedisModuleType *ISet;
 
 int dictEncObjKeyCompare(void *privdata, const void *key1, const void *key2) {
   DICT_NOTUSED(privdata);
-  return RedisModule_StringCompare((RedisModuleString *) key1,
-				   (RedisModuleString *) key2) == 0;
+  return RedisModule_StringCompare((RedisModuleString *) key1,(RedisModuleString *) key2) == 0;
 }
 
 uint64_t dictEncObjHash(const void *key) {
@@ -1061,12 +1060,12 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) 
 
     RedisModuleTypeMethods tm = {
 	.version     = REDISMODULE_TYPE_METHOD_VERSION,
-	/* .rdb_load    = isetRdbLoad, */
-	/* .rdb_save    = isetRdbSave, */
-	/* .aof_rewrite = rewriteIntervalSetObject, */
+	.rdb_load    = isetRdbLoad,
+	.rdb_save    = isetRdbSave,
+	.aof_rewrite = rewriteIntervalSetObject,
 	.free        = avlFree,
-	/* .mem_usage   = isetLength, */
-	/* .digest      = NULL */
+	.mem_usage   = isetLength,
+	.digest      = NULL
     };
 
     ISet = RedisModule_CreateDataType(ctx,"intervalS",0,&tm);
